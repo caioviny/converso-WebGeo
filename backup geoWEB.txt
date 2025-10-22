@@ -1,0 +1,794 @@
+# -*- coding: utf-8 -*-
+"""
+Plugin Converter - Versão corrigida com threading adequado
+"""
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QVariant, pyqtSignal, QObject
+from qgis.PyQt.QtGui import QIcon, QColor
+from qgis.PyQt.QtWidgets import (QAction, QMessageBox, QFileDialog, QDialog, 
+                                 QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
+                                 QLineEdit, QProgressBar, QGroupBox)
+from .seila_dialog import ConverterDialog
+from qgis.core import (
+    QgsProject,
+    QgsVectorLayer,
+    QgsField,
+    QgsFeature,
+    QgsWkbTypes,
+    QgsFeatureRequest,
+    QgsProcessing,
+    QgsProcessingContext,
+    QgsProcessingFeedback,
+    QgsCoordinateReferenceSystem,
+    QgsVectorFileWriter,
+    QgsGeometry,
+    QgsPointXY,
+    QgsApplication,
+    QgsTask,
+    QgsMessageLog,
+    Qgis
+)
+from qgis.gui import QgsMapToolEmitPoint, QgsMapToolIdentifyFeature, QgsRubberBand
+from qgis.utils import iface as global_iface
+
+import os.path
+import processing
+
+
+
+class ConversaoTask(QgsTask):
+    """Task para processar conversão em background"""
+    
+    def __init__(self, nome, selected_features, diretorio_saida, camada_quadra_name):
+        super().__init__(nome, QgsTask.CanCancel)
+        self.selected_features = selected_features
+        self.diretorio_saida = diretorio_saida
+        self.camada_quadra_name = camada_quadra_name
+        self.error_message = None
+        self.success_message = None
+        self.camadas_criadas = []
+        
+    def run(self):
+        """Executa o processamento em background"""
+        try:
+            QgsMessageLog.logMessage('Iniciando processamento em background', 'Converter', Qgis.Info)
+            
+            
+            
+         
+            # Busca camadas do projeto
+            camada_quadra = None
+            camada_lote = None
+            camada_slote = None
+            camada_setor = None
+            
+            for lyr_id, lyr in QgsProject.instance().mapLayers().items():
+                nome = lyr.name().lower()
+                if nome == self.camada_quadra_name.lower() and isinstance(lyr, QgsVectorLayer):
+                    camada_quadra = lyr
+                elif "lote" in nome and "slote" not in nome:
+                    camada_lote = lyr
+                elif "slote" in nome:
+                    camada_slote = lyr
+                elif "setor" in nome:
+                    camada_setor = lyr
+            
+            if not camada_quadra or not camada_lote or not camada_slote:
+                self.error_message = "Camadas necessárias não encontradas no projeto."
+                return False
+            
+            if self.isCanceled():
+                return False
+                
+                        
+            # Cria camada temporária com as quadras selecionadas
+            quadra_temp = QgsVectorLayer(
+                f"{QgsWkbTypes.displayString(camada_quadra.wkbType())}?crs=EPSG:31984",
+                "Quadras_Selecionadas",
+                "memory"
+            )
+            prov = quadra_temp.dataProvider()
+            prov.addAttributes(camada_quadra.fields())
+            quadra_temp.updateFields()
+            
+            for selected_feature in self.selected_features:
+                feat_temp = QgsFeature()
+                feat_temp.setGeometry(selected_feature.geometry())
+                feat_temp.setAttributes(selected_feature.attributes())
+                prov.addFeature(feat_temp)
+            
+            quadra_temp.updateExtents()
+            
+            if self.isCanceled():
+                return False
+            
+            
+            QgsMessageLog.logMessage('Extraindo Slotes...', 'Converter', Qgis.Info)
+            
+            # Extrai Slotes
+            slotes_extraidos = processing.run('native:extractbylocation', {
+                'INPUT': camada_slote,
+                'INTERSECT': quadra_temp,
+                'PREDICATE': [0],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(5)
+            if self.isCanceled():
+                return False
+            
+            
+            QgsMessageLog.logMessage('Extraindo Lotes...', 'Converter', Qgis.Info)
+            
+            # Extrai Lotes
+            lotes_extraidos = processing.run('native:extractbylocation', {
+                'INPUT': camada_lote,
+                'INTERSECT': quadra_temp,
+                'PREDICATE': [0],
+                'OUTPUT': 'memory:'
+            } )['OUTPUT']
+            self.setProgress(10)
+            if self.isCanceled():
+                return False
+            
+            
+            QgsMessageLog.logMessage('Processando Quadras...', 'Converter', Qgis.Info)
+            
+            # Processa Quadras
+            quadras_processadas = processing.run('native:refactorfields', {
+                'INPUT': quadra_temp,
+                'FIELDS_MAPPING': [
+                    {'expression': 'lpad("quadra",4,0)', 'length': 4, 'name': 'Quadra', 'precision': 0, 'type': 10},
+                    {'expression': 'lpad(aggregate(layer:=\'Setor\', aggregate:=\'max\', expression:="setor", filter:=intersects($geometry, geometry(@parent))),2,0)', 
+                     'length': 2, 'name': 'Zona', 'precision': 0, 'type': 10}
+                ],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(20)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Filtra lotes com matrícula
+            lotes_com_matricula = processing.run('native:extractbyexpression', {
+                'INPUT': lotes_extraidos,
+                'EXPRESSION': '"matricula" is not null',
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(25)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Filtra slotes com matrícula
+            slotes_com_matricula = processing.run('native:extractbyexpression', {
+                'INPUT': slotes_extraidos,
+                'EXPRESSION': '"matricula" is not null',
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(30)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Converte para linhas
+            lotes_linhas = processing.run('native:polygonstolines', {
+                'INPUT': lotes_com_matricula,
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(35)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            slotes_linhas = processing.run('native:polygonstolines', {
+                'INPUT': slotes_com_matricula,
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(40)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Cria centroides
+            centroides_lotes = processing.run('native:centroids', {
+                'INPUT': lotes_com_matricula,
+                'ALL_PARTS': False,
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(45)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            centroides_slotes = processing.run('native:centroids', {
+                'INPUT': slotes_com_matricula,
+                'ALL_PARTS': False,
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(50)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Adiciona Zona aos Lotes
+            lotes_linhas_zona = processing.run('native:refactorfields', {
+                'INPUT': lotes_linhas,
+                'FIELDS_MAPPING': [
+                    {'expression': 'lpad(aggregate(layer:=\'Setor\', aggregate:=\'max\', expression:="setor", filter:=intersects($geometry, geometry(@parent))),2,0)',
+                     'length': 2, 'name': 'Zona', 'precision': 0, 'type': 10}
+                ],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(55)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Adiciona Zona aos Slotes
+            slotes_linhas_zona = processing.run('native:refactorfields', {
+                'INPUT': slotes_linhas,
+                'FIELDS_MAPPING': [
+                    {'expression': 'lpad(aggregate(layer:=\'Setor\', aggregate:=\'max\', expression:="setor", filter:=intersects($geometry, geometry(@parent))),2,0)',
+                     'length': 2, 'name': 'Zona', 'precision': 0, 'type': 10}
+                ],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(60)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Mescla linhas
+            linhas_mescladas = processing.run('native:mergevectorlayers', {
+                'LAYERS': [slotes_linhas_zona, lotes_linhas_zona],
+                'CRS': QgsCoordinateReferenceSystem('EPSG:31984'),
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(65)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Processa centroides dos Lotes
+            centroides_lotes_valor = processing.run('native:refactorfields', {
+                'INPUT': centroides_lotes,
+                'FIELDS_MAPPING': [
+                    {'expression': '"matricula"', 'length': 12, 'name': 'Valor', 'precision': 0, 'type': 10}
+                ],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(70)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Processa centroides dos Slotes
+            centroides_slotes_valor = processing.run('native:refactorfields', {
+                'INPUT': centroides_slotes,
+                'FIELDS_MAPPING': [
+                    {'expression': '"matricula"', 'length': 12, 'name': 'Valor', 'precision': 0, 'type': 10}
+                ],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(75)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Mescla centroides
+            centroides_mesclados = processing.run('native:mergevectorlayers', {
+                'LAYERS': [centroides_slotes_valor, centroides_lotes_valor],
+                'CRS': QgsCoordinateReferenceSystem('EPSG:31984'),
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(80)
+            if self.isCanceled():
+                return False
+            
+            
+            
+            # Finaliza camada de Lotes
+            lotes_final = processing.run('native:refactorfields', {
+                'INPUT': linhas_mescladas,
+                'FIELDS_MAPPING': [
+                    {'expression': '"Zona"', 'length': 2, 'name': 'Zona', 'precision': 0, 'type': 10}
+                ],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(85)
+            if self.isCanceled():
+                return False
+            
+           
+            
+            # Finaliza camada Simb_Zn
+            simb_zn_final = processing.run('native:refactorfields', {
+                'INPUT': centroides_mesclados,
+                'FIELDS_MAPPING': [
+                    {'expression': '"Valor"', 'length': 12, 'name': 'Valor', 'precision': 0, 'type': 10}
+                ],
+                'OUTPUT': 'memory:'
+            })['OUTPUT']
+            self.setProgress(90)
+            if self.isCanceled():
+                return False
+            
+            
+            QgsMessageLog.logMessage('Salvando camadas...', 'Converter', Qgis.Info)
+            
+            # Salva as camadas
+            camadas_para_salvar = [
+                (simb_zn_final, "Simb_Zn"),
+                (lotes_final, "Lotes"),
+                (quadras_processadas, "Quadras")
+            ]
+        
+            for camada, nome_base in camadas_para_salvar:
+                if self.isCanceled():
+                    return False
+                    
+                caminho_saida = os.path.join(self.diretorio_saida, f"{nome_base}.shp")
+                
+                error = QgsVectorFileWriter.writeAsVectorFormat(
+                    camada,
+                    caminho_saida,
+                    "UTF-8",
+                    QgsCoordinateReferenceSystem("EPSG:31984"),
+                    "ESRI Shapefile"
+                )
+                
+                if error[0] != QgsVectorFileWriter.NoError:
+                    self.error_message = f"Erro ao salvar {nome_base}: {error[1]}"
+                    return False
+                
+                self.camadas_criadas.append((caminho_saida, nome_base))
+           
+           
+            # Prepara mensagem de sucesso
+            ins_quadras = []
+            for feat in self.selected_features:
+                if 'ins_quadra' in [field.name() for field in feat.fields()]:
+                    ins_quadras.append(str(feat['ins_quadra']))
+                else:
+                    ins_quadras.append(f"ID:{feat.id()}")
+
+            self.setProgress(100)
+            quadras_texto = ', '.join(ins_quadras)
+            self.success_message = (
+                f"Conversão concluída com sucesso!\n\n"
+                f"Quadras selecionadas: ({quadras_texto})\n\n"
+                f"Camadas salvas em: {self.diretorio_saida}\n"
+                f"Camadas criadas:\n"
+                f"- Quadras ({len(self.selected_features)} quadra(s))\n"
+                f"- Lotes\n"
+                f"- Simb_Zn"
+            )
+            
+            QgsMessageLog.logMessage('Processamento concluído com sucesso', 'Converter', Qgis.Success)
+            return True
+            
+        except Exception as e:
+            self.error_message = str(e)
+            QgsMessageLog.logMessage(f'Erro no processamento: {str(e)}', 'Converter', Qgis.Critical)
+            return False
+    
+    def finished(self, result):
+        """Chamado quando a task termina (executa na thread principal)"""
+        # Este método executa na thread principal, então é seguro atualizar a UI aqui
+        pass
+
+
+class Converter:
+    """Plugin Conversão para GeoWEB - com seleção por polígono"""
+
+    def __init__(self, iface):
+        self.iface = iface if iface else global_iface
+        self.plugin_dir = os.path.dirname(__file__)
+
+        locale = QSettings().value('locale/userLocale')[0:2]
+        locale_path = os.path.join(
+            self.plugin_dir, 'i18n', f'Converter_{locale}.qm'
+        )
+        if os.path.exists(locale_path):
+            self.translator = QTranslator()
+            self.translator.load(locale_path)
+            QCoreApplication.installTranslator(self.translator)
+
+        self.actions = []
+        self.menu = self.tr(u'&Conversão para GeoWEB')
+        self.first_start = None
+        self.selected_features = []
+        self.map_tool = None
+        self.diretorio_saida = None
+        self.camada_quadra = None
+        self.highlight_rubber_bands = []
+        self.current_task = None
+        
+        # Variáveis para desenho do polígono
+        self.points_polygon = []
+        self.rubber_band_polygon = None
+        self.temp_rubber_band = None
+    
+    def tr(self, message):
+        return QCoreApplication.translate('Converter', message)
+
+    def add_action(
+        self,
+        icon_path,
+        text,
+        callback,
+        enabled_flag=True,
+        add_to_menu=True,
+        add_to_toolbar=True,
+        parent=None
+    ):
+        icon = QIcon(icon_path)
+        action = QAction(icon, text, parent)
+        action.triggered.connect(callback)
+        action.setEnabled(enabled_flag)
+
+        if add_to_toolbar:
+            self.iface.addToolBarIcon(action)
+        if add_to_menu:
+            self.iface.addPluginToMenu(self.menu, action)
+        self.actions.append(action)
+        return action
+
+    def initGui(self):
+        icon_path = os.path.join(self.plugin_dir, 'icon.png')
+        self.add_action(
+            icon_path,
+            text=self.tr(u'Conversão para GeoWEB'),
+            callback=self.run,
+            parent=self.iface.mainWindow()
+        )
+        self.first_start = True
+
+    def unload(self):
+        self.limpar_destaques()
+        for action in self.actions:
+            self.iface.removePluginMenu(self.menu, action)
+            self.iface.removeToolBarIcon(action)
+        if self.camada_quadra:
+            self.camada_quadra.removeSelection()
+
+    def run(self):
+        if self.first_start:
+            self.first_start = False
+            self.dlg = ConverterDialog(parent=self.iface.mainWindow())
+
+            self.dlg.Toolbtn.clicked.connect(self.escolher_pasta)
+            self.dlg.btnSelecionar.clicked.connect(self.ativar_selecao)
+            self.dlg.btnProcessar.clicked.connect(self.executar)
+
+        # Reseta as seleções
+        self.selected_features = []
+        self.diretorio_saida = None
+        self.dlg.lblPasta.clear()
+        self.dlg.progressBar.setValue(0)
+        self.dlg.lblInfo.setText("Nenhuma quadra selecionada")
+        self.dlg.btnProcessar.setEnabled(False)
+        
+        self.dlg.setWindowModality(Qt.NonModal)
+        self.dlg.show()
+        
+    def escolher_pasta(self):
+        """Abre diálogo para escolher a pasta de destino"""
+        diretorio = QFileDialog.getExistingDirectory(
+            self.dlg,
+            "Selecione o diretório para salvar as camadas",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+
+        if diretorio:
+            self.diretorio_saida = diretorio
+            self.dlg.lblPasta.setText(diretorio)
+            self.atualizar_botao_processar()
+
+    def atualizar_botao_processar(self):
+        """Habilita o botão Processar apenas se pasta e quadras estiverem selecionadas"""
+        if self.diretorio_saida and len(self.selected_features) > 0:
+            self.dlg.btnProcessar.setEnabled(True)
+        else:
+            self.dlg.btnProcessar.setEnabled(False)
+
+    def limpar_destaques(self):
+        """Remove todos os destaques visuais das quadras"""
+        for rubber_band in self.highlight_rubber_bands:
+            rubber_band.reset()
+        self.highlight_rubber_bands = []
+        self.iface.mapCanvas().refresh()
+
+    def destacar_quadras(self, features):
+        """Destaca visualmente as quadras selecionadas em amarelo"""
+        self.limpar_destaques()
+        
+        for feature in features:
+            rubber_band = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PolygonGeometry)
+            rubber_band.setColor(QColor(255, 255, 0, 180))
+            rubber_band.setFillColor(QColor(255, 255, 0, 150))
+            rubber_band.setWidth(4)
+            rubber_band.setToGeometry(feature.geometry(), None)
+            self.highlight_rubber_bands.append(rubber_band)
+        
+        self.iface.mapCanvas().refresh()
+
+    def inicializar_rubber_bands(self):
+        """Inicializa os rubber bands para desenho do polígono"""
+        if self.rubber_band_polygon is None:
+            self.rubber_band_polygon = QgsRubberBand(
+                self.iface.mapCanvas(), 
+                QgsWkbTypes.PolygonGeometry
+            )
+            self.rubber_band_polygon.setColor(QColor(255, 0, 0, 100))
+            self.rubber_band_polygon.setWidth(2)
+        
+        if self.temp_rubber_band is None:
+            self.temp_rubber_band = QgsRubberBand(
+                self.iface.mapCanvas(), 
+                QgsWkbTypes.LineGeometry
+            )
+            self.temp_rubber_band.setColor(QColor(255, 0, 0, 150))
+            self.temp_rubber_band.setWidth(2)
+
+    def resetar_desenho_poligono(self):
+        """Reseta o desenho do polígono"""
+        self.points_polygon = []
+        if self.rubber_band_polygon:
+            self.rubber_band_polygon.reset(QgsWkbTypes.PolygonGeometry)
+        if self.temp_rubber_band:
+            self.temp_rubber_band.reset(QgsWkbTypes.LineGeometry)
+
+    def canvas_release_event(self, point):
+        """Adiciona ponto ao polígono ao clicar"""
+        self.points_polygon.append(point)
+        self.rubber_band_polygon.addPoint(point, True)
+        self.rubber_band_polygon.show()
+
+    def canvas_move_event(self, event):
+        """Mostra linha temporária enquanto move o mouse"""
+        if len(self.points_polygon) > 0:
+            point = self.iface.mapCanvas().getCoordinateTransform().toMapCoordinates(
+                event.pos().x(), event.pos().y()
+            )
+            self.temp_rubber_band.reset(QgsWkbTypes.LineGeometry)
+            self.temp_rubber_band.addPoint(self.points_polygon[-1], False)
+            self.temp_rubber_band.addPoint(point, True)
+            self.temp_rubber_band.show()
+
+    def canvas_key_press_event(self, event):
+        """Finaliza o polígono ao pressionar Enter ou Esc para cancelar"""
+        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+            if len(self.points_polygon) >= 3:
+                polygon = QgsGeometry.fromPolygonXY([self.points_polygon])
+                self.processar_poligono(polygon)
+                self.resetar_desenho_poligono()
+        elif event.key() == Qt.Key_Escape:
+            self.resetar_desenho_poligono()
+            self.iface.mapCanvas().unsetMapTool(self.map_tool)
+            QMessageBox.information(self.dlg, "Cancelado", "Seleção por polígono cancelada.")
+
+    def ativar_selecao(self):
+        """Ativa modo de desenho de polígono para selecionar múltiplas quadras"""
+        if not self.diretorio_saida:
+            QMessageBox.warning(self.dlg, "Aviso", "Por favor, escolha primeiro a pasta de destino.")
+            return
+
+        # Busca a camada Quadra
+        self.camada_quadra = None
+        for lyr in QgsProject.instance().mapLayers().values():
+            if lyr.name().lower() == "quadra" and lyr.type() == QgsVectorLayer.VectorLayer:
+                self.camada_quadra = lyr
+                break
+
+        if self.camada_quadra is None:
+            QMessageBox.warning(self.dlg, "Aviso", "Camada 'Quadra' não encontrada no projeto.")
+            return
+
+        self.limpar_destaques()
+        self.resetar_desenho_poligono()
+        self.inicializar_rubber_bands()
+
+        # Cria ferramenta de mapa customizada
+        self.map_tool = QgsMapToolEmitPoint(self.iface.mapCanvas())
+        self.map_tool.canvasClicked.connect(self.canvas_release_event)
+        self.map_tool.canvasMoveEvent = self.canvas_move_event
+        self.map_tool.keyPressEvent = self.canvas_key_press_event
+        
+        self.iface.mapCanvas().setMapTool(self.map_tool)
+        
+        self.dlg.lblInfo.setText(
+            "Desenhe um polígono no mapa:\n"
+            "• Clique para adicionar pontos\n"
+            "• Enter para finalizar\n"
+            "• ESC para cancelar"
+        )
+        
+        QMessageBox.information(
+            self.dlg, 
+            "Modo de Seleção Ativado", 
+            "Desenhe um polígono clicando no mapa.\n\n"
+            "• Clique com botão esquerdo para adicionar pontos\n"
+            "• Pressione ENTER para finalizar o polígono\n"
+            "• Pressione ESC para cancelar\n\n"
+            "Todas as quadras dentro do polígono serão selecionadas."
+        )
+
+    def processar_poligono(self, polygon):
+        """Processa o polígono desenhado e seleciona as quadras"""
+        if not self.camada_quadra:
+            return
+            
+        self.iface.mapCanvas().unsetMapTool(self.map_tool)
+        
+        request = QgsFeatureRequest().setFilterRect(polygon.boundingBox())
+        quadras_selecionadas = []
+        
+        for feature in self.camada_quadra.getFeatures(request):
+            if polygon.intersects(feature.geometry()):
+                quadras_selecionadas.append(feature)
+        
+        if len(quadras_selecionadas) == 0:
+            QMessageBox.information(
+                self.dlg, 
+                "Nenhuma Quadra", 
+                "Nenhuma quadra foi encontrada dentro do polígono desenhado."
+            )
+            self.dlg.lblInfo.setText("Nenhuma quadra selecionada")
+            return
+        
+        self.selected_features = quadras_selecionadas
+        self.destacar_quadras(quadras_selecionadas)
+        
+        ins_quadras = []
+        for feat in self.selected_features:
+            if 'ins_quadra' in [field.name() for field in feat.fields()]:
+                ins_quadras.append(str(feat['ins_quadra']))
+            else:
+                ins_quadras.append(f"ID:{feat.id()}")
+        
+        self.dlg.lblInfo.setText(
+            f"{len(self.selected_features)} quadra(s) selecionada(s):\n"
+            f"({', '.join(ins_quadras)})"
+        )
+        
+        self.atualizar_botao_processar()
+        
+        QMessageBox.information(
+            self.dlg,
+            "Seleção Concluída",
+            f"{len(self.selected_features)} quadra(s) selecionada(s):\n{', '.join(ins_quadras)}"
+        )
+
+    def executar(self):
+        """Cria a QgsTask para executar conversão em background"""
+        if not self.selected_features:
+            QMessageBox.warning(self.dlg, "Aviso", "Nenhuma quadra selecionada.")
+            return
+
+        if not self.diretorio_saida:
+            QMessageBox.warning(self.dlg, "Aviso", "Diretório de saída não definido.")
+            return
+
+        if self.map_tool:
+            self.iface.mapCanvas().unsetMapTool(self.map_tool)
+
+        # Desabilita botões durante processamento
+        self.dlg.btnProcessar.setEnabled(False)
+        self.dlg.btnSelecionar.setEnabled(False)
+        self.dlg.progressBar.setValue(0)
+
+        # Copia as features selecionadas (geometria e atributos)
+        features_copy = []
+        for feat in self.selected_features:
+            new_feat = QgsFeature()
+            new_feat.setGeometry(QgsGeometry(feat.geometry()))
+            new_feat.setAttributes(feat.attributes())
+            new_feat.setFields(feat.fields())
+            features_copy.append(new_feat)
+
+        # Cria e inicia a task
+        self.current_task = ConversaoTask(
+            "Conversão GeoWEB",
+            features_copy,
+            self.diretorio_saida,
+            self.camada_quadra.name()
+        )
+        
+        # Conecta sinais da task
+        self.current_task.progressChanged.connect(self.atualizar_progresso_task)
+        self.current_task.taskCompleted.connect(self.task_concluida)
+        self.current_task.taskTerminated.connect(self.task_terminada)
+        
+        # Adiciona a task ao gerenciador
+        QgsApplication.taskManager().addTask(self.current_task)
+        
+        self.dlg.lblInfo.setText("Processando... Aguarde.")
+
+    def atualizar_progresso_task(self):
+        """Atualiza a barra de progresso com base no progresso da task"""
+        if self.current_task:
+            progresso = self.current_task.progress()
+            print(int(progresso))
+            self.dlg.progressBar.setValue(int(progresso))
+
+    def task_concluida(self):
+        """Chamado quando a task é concluída com sucesso"""
+        if not self.current_task:
+            return
+            
+        # Carrega as camadas criadas no QGIS
+        root = QgsProject.instance().layerTreeRoot()
+        grupo_geoweb = root.addGroup("Geoweb")
+        
+        for caminho_saida, nome_base in self.current_task.camadas_criadas:
+            nova_camada = QgsVectorLayer(caminho_saida, nome_base, "ogr")
+            
+            if nova_camada.isValid():
+                QgsProject.instance().addMapLayer(nova_camada, False)
+                grupo_geoweb.addLayer(nova_camada)
+            else:
+                QMessageBox.warning(
+                    self.dlg, 
+                    "Aviso", 
+                    f"Não foi possível carregar a camada: {nome_base}"
+                )
+        
+        # Mostra mensagem de sucesso
+        if self.current_task.success_message:
+            QMessageBox.information(
+                self.dlg,
+                "Sucesso",
+                self.current_task.success_message + 
+                "\n\nAs camadas foram carregadas no grupo 'Geoweb'."
+            )
+        
+        # Limpa e reabilita interface
+        self.selected_features = []
+        self.limpar_destaques()
+        self.reabilitar_botoes()
+        self.dlg.progressBar.setValue(100)
+        self.dlg.lblInfo.setText("Processamento concluído!")
+        
+        self.current_task = None
+
+    def task_terminada(self):
+        """Chamado quando a task é terminada (erro ou cancelamento)"""
+        if not self.current_task:
+            return
+            
+        if self.current_task.error_message:
+            QMessageBox.critical(
+                self.dlg,
+                "Erro",
+                f"Erro durante o processamento:\n{self.current_task.error_message}"
+            )
+        else:
+            QMessageBox.information(
+                self.dlg,
+                "Cancelado",
+                "Processamento cancelado pelo usuário."
+            )
+        
+        self.reabilitar_botoes()
+        self.dlg.progressBar.setValue(0)
+        self.dlg.lblInfo.setText("Processamento cancelado ou com erro.")
+        
+        self.current_task = None
+
+    def reabilitar_botoes(self):
+        """Reabilita os botões após o processamento"""
+        self.dlg.btnSelecionar.setEnabled(True)
+        self.atualizar_botao_processar()
